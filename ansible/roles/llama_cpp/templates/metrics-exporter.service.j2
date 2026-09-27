@@ -1,0 +1,16 @@
+[Unit]
+Description=Fleet /metrics sidecar (wraps llama-server stats for Prometheus)
+After=llama-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/python3 /opt/llama-fleet/metrics_exporter.py \
+  --port {{ metrics_port }} \
+  --upstream http://127.0.0.1:{{ llama_server_port }} \
+  --access-log {{ log_dir }}/metrics-exporter.jsonl \
+  --server-log {{ log_dir }}/llama-server.err.log
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

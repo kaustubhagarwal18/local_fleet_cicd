@@ -1,0 +1,7 @@
+---
+- name: Base configuration for all fleet nodes
+  hosts: llama_fleet
+  become: true
+  roles:
+    - common
+    - observability

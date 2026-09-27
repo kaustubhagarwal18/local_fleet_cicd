@@ -1,0 +1,11 @@
+# Rendered per-node for reference; the canonical scrape config that targets
+# the whole fleet lives at observability/prometheus/prometheus.yml and is
+# generated from the Terraform/Ansible inventory by scripts/verify.sh.
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: "llama-fleet-node"
+    static_configs:
+      - targets: ["localhost:{{ metrics_port }}"]
+        labels:
+          node: "{{ inventory_hostname }}"

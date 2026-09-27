@@ -1,0 +1,8 @@
+# Node-side secrets for the llama_fleet group. Nothing in the pipeline needs
+# one today; if you add some:
+#   cp vault.yml.example vault.yml            # gitignored
+#   ansible-vault encrypt ansible/inventory/group_vars/llama_fleet/vault.yml
+# then run playbooks with --ask-vault-pass (or ANSIBLE_VAULT_PASSWORD_FILE).
+# Ansible loads every file in group_vars/llama_fleet/ for the fleet's hosts,
+# so the vaulted vars are available to the roles like any other variable.
+huggingface_token: "changeme"

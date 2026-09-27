@@ -1,0 +1,25 @@
+---
+# Converges the common + llama_cpp (build) roles in a container and checks
+# the result, including an idempotence pass. Run with `make molecule`.
+driver:
+  name: docker
+platforms:
+  - name: llama-cpp-molecule
+    # Pinned by digest (multi-arch: amd64 + arm64) for reproducible runs.
+    image: "geerlingguy/docker-ubuntu2204-ansible@sha256:33d336f044299122a9a0e8f23440693517297d7bc3eefd631225f56b060042c0"
+    command: ${MOLECULE_DOCKER_COMMAND:-""}
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    cgroupns_mode: host
+    privileged: true
+    pre_build_image: true
+provisioner:
+  name: ansible
+  env:
+    ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/roles"
+  playbooks:
+    prepare: prepare.yml
+    converge: converge.yml
+    verify: verify.yml
+verifier:
+  name: ansible
