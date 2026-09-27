@@ -1,7 +1,0 @@
----
-# Entry point for tasks/main.yml: build (default), deploy, or rollback.
-llama_cpp_action: build
-
-# Seconds the deploy health gate waits for llama-server and the exporter to
-# accept connections before treating the release as failed and rolling back.
-llama_cpp_start_timeout: 60

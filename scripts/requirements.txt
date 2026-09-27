@@ -1,9 +1,0 @@
-# Controller-side tooling, installed into .venv by `make setup` and by every
-# CI job, pinned exactly so local runs, act and GitHub CI use the same
-# versions. ansible 14.x (ansible-core 2.21) requires Python >= 3.12.
-ansible==14.4.0
-ansible-lint==26.9.0
-yamllint==1.38.0
-molecule==26.9.0
-molecule-plugins[docker]==26.7.15
-pytest==9.1.1
