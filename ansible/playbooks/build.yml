@@ -1,0 +1,7 @@
+---
+- name: Build llama.cpp from source (CPU) and stage GGUF model
+  hosts: llama_fleet
+  become: true
+  roles:
+    - llama_cpp
+    - model

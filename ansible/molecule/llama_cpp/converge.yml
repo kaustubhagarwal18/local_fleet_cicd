@@ -1,0 +1,10 @@
+---
+- name: Converge
+  hosts: all
+  become: true
+  vars_files:
+    # Same pinned versions and paths the real fleet uses.
+    - ../../inventory/group_vars/all.yml
+  roles:
+    - common
+    - llama_cpp  # llama_cpp_action defaults to "build"

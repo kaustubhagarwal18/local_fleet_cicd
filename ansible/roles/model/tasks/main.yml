@@ -1,0 +1,34 @@
+---
+- name: Check if model already present
+  ansible.builtin.stat:
+    path: "{{ model_dir }}/{{ model_file }}"
+  register: model_stat
+
+- name: Download GGUF model from Hugging Face (idempotent)
+  ansible.builtin.get_url:
+    url: "https://huggingface.co/{{ model_repo }}/resolve/{{ model_revision }}/{{ model_file }}"
+    dest: "{{ model_dir }}/{{ model_file }}"
+    checksum: "sha256:{{ model_sha256 }}"
+    mode: "0644"
+    timeout: 300
+  when: not model_stat.stat.exists
+  register: model_download
+  retries: 2
+  delay: 5
+  until: model_download is succeeded
+
+# Also covers a model that was already present (download skipped), e.g.
+# left over from before the checksum was pinned or corrupted on disk.
+- name: Compute staged model checksum
+  ansible.builtin.stat:
+    path: "{{ model_dir }}/{{ model_file }}"
+    checksum_algorithm: sha256
+  register: model_checksum
+
+- name: Verify model matches the pinned sha256
+  ansible.builtin.assert:
+    that:
+      - model_checksum.stat.exists
+      - model_checksum.stat.checksum == model_sha256
+    fail_msg: "{{ model_file }} is missing or its sha256 does not match model_sha256"
+    success_msg: "Model staged at {{ model_dir }}/{{ model_file }} (sha256 verified)"

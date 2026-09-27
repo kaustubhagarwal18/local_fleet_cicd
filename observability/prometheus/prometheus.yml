@@ -1,0 +1,20 @@
+# Scrape config for the local fleet (see observability/docker-compose.yml).
+# Targets are NOT hardcoded: scripts/gen_prom_targets.sh renders
+# targets/*.json from the live Ansible inventory (`make observability` runs
+# it), and file_sd picks up changes without restarting Prometheus.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Sidecar: tokens/sec, p50/p95 latency, model load time, requests/errors.
+  - job_name: llama-exporter
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/exporter.json]
+        refresh_interval: 30s
+
+  # llama-server's native --metrics endpoint (llamacpp:* series).
+  - job_name: llama-server
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/server.json]
+        refresh_interval: 30s

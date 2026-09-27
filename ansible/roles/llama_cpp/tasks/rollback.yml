@@ -1,0 +1,66 @@
+---
+- name: Check a previous release pointer exists
+  ansible.builtin.stat:
+    path: "{{ llama_release_dir }}/.previous"
+  register: llama_cpp_previous_pointer
+
+- name: Restore previous release symlink
+  when: llama_cpp_previous_pointer.stat.exists
+  block:
+    - name: Read previous release path
+      ansible.builtin.slurp:
+        src: "{{ llama_release_dir }}/.previous"
+      register: llama_cpp_previous_raw
+
+    - name: Point `current` back at the previous release
+      ansible.builtin.file:
+        src: "{{ (llama_cpp_previous_raw.content | b64decode).strip() }}"
+        dest: "{{ llama_release_dir }}/current"
+        state: link
+        force: true
+
+    - name: Restart llama-server on the restored release
+      ansible.builtin.systemd:
+        name: llama-server
+        state: restarted
+
+    # The exporter isn't part of a release, so it's only started (not
+    # restarted) in case it was down; the check below goes through it.
+    - name: Ensure the metrics exporter is running
+      ansible.builtin.systemd:
+        name: metrics-exporter
+        state: started
+
+    # Same budget and check as the deploy gate: the restored release must
+    # serve real completions through the exporter, not just report /health.
+    - name: Wait for llama-server and the metrics exporter to accept connections
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: "{{ item }}"
+        delay: 2
+        timeout: "{{ llama_cpp_start_timeout }}"
+      loop:
+        - "{{ llama_server_port }}"
+        - "{{ metrics_port }}"
+
+    - name: Confirm rollback health — inference smoke test
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ metrics_port }}/completion"
+        method: POST
+        body_format: json
+        body:
+          prompt: "Health check:"
+          n_predict: 8
+        status_code: 200
+        timeout: 30
+      register: llama_cpp_rollback_health
+      retries: 3
+      delay: 5
+      until: >-
+        llama_cpp_rollback_health.status == 200
+        and (llama_cpp_rollback_health.json | default({})).content | default('') | trim | length > 0
+
+- name: No previous release recorded — nothing to roll back to
+  when: not llama_cpp_previous_pointer.stat.exists
+  ansible.builtin.fail:
+    msg: "No previous release recorded on {{ inventory_hostname }}; cannot auto-rollback."

@@ -1,0 +1,18 @@
+[
+  {
+    "targets": [
+      "192.168.252.5:9100"
+    ],
+    "labels": {
+      "node": "llama-node-1"
+    }
+  },
+  {
+    "targets": [
+      "192.168.252.7:9100"
+    ],
+    "labels": {
+      "node": "llama-node-2"
+    }
+  }
+]

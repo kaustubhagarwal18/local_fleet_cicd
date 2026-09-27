@@ -1,0 +1,8 @@
+---
+- name: Roll a single node back to the last-known-good release
+  hosts: "{{ target_host | default('llama_fleet') }}"
+  become: true
+  roles:
+    - role: llama_cpp
+      vars:
+        llama_cpp_action: rollback

@@ -1,0 +1,220 @@
+---
+# This role has three entry points, selected via `llama_cpp_action`:
+#   build (default) -> build from source
+#   deploy          -> release + health-gated cutover (used by playbooks/deploy.yml, serial:1)
+#   rollback        -> restore the previous release symlink (used by playbooks/rollback.yml)
+
+- name: Build llama.cpp from source
+  when: llama_cpp_action == 'build'
+  block:
+    - name: Clone llama.cpp at pinned ref
+      ansible.builtin.git:
+        repo: https://github.com/ggml-org/llama.cpp.git
+        dest: "{{ llama_build_dir }}"
+        version: "{{ llama_cpp_ref }}"
+        depth: 1
+        force: true
+
+    # Configure once; `cmake --build` re-runs configure itself when the
+    # checked-out sources change. Static libs make llama-server a single
+    # self-contained binary: with the default shared build it is a small
+    # launcher that loads libllama/libggml from the build dir, which every
+    # build overwrites, so an older release could never really be rolled
+    # back to.
+    - name: Configure CMake (CPU build, static)
+      ansible.builtin.command:
+        cmd: cmake -B build-static -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+        chdir: "{{ llama_build_dir }}"
+        creates: "{{ llama_build_dir }}/build-static/CMakeCache.txt"
+
+    # Only llama-server is deployed, so don't compile the other ~40 tools.
+    # "Built target" is printed even on a no-op build, so report a change
+    # only when something was actually compiled or linked.
+    - name: Build llama-server (cached — only rebuilds changed objects)
+      ansible.builtin.command:
+        cmd: "cmake --build build-static --config Release --target llama-server -j {{ ansible_processor_vcpus | default(2) }}"
+        chdir: "{{ llama_build_dir }}"
+      register: llama_cpp_build_result
+      changed_when: >-
+        'Building' in llama_cpp_build_result.stdout
+        or 'Linking' in llama_cpp_build_result.stdout
+
+    # Stage a new release only when the binary differs from the last staged
+    # one, so each real rebuild becomes a new release that deploy.yml cuts
+    # over to, while re-runs with no source change don't pile up releases.
+    - name: Stage build artifact as a timestamped release
+      ansible.builtin.shell: |
+        set -euo pipefail
+        BIN="{{ llama_build_dir }}/build-static/bin/llama-server"
+        LAST="$(cat {{ llama_release_dir }}/.last_built 2>/dev/null || true)"
+        if [ -n "$LAST" ] && cmp -s "$BIN" "$LAST/llama-server"; then
+          echo "unchanged: $LAST"
+          exit 0
+        fi
+        REL="{{ llama_release_dir }}/{{ ansible_date_time.iso8601_basic_short }}"
+        mkdir -p "$REL"
+        cp "$BIN" "$REL/llama-server"
+        echo "$REL" > {{ llama_release_dir }}/.last_built
+        echo "staged: $REL"
+      args:
+        executable: /bin/bash
+      register: llama_cpp_stage_result
+      changed_when: "'staged:' in llama_cpp_stage_result.stdout"
+
+# --- deploy: point `current` at the newly built release, then health-check ---
+- name: Deploy new release with health gate
+  when: llama_cpp_action == 'deploy'
+  block:
+    - name: Read last built release path
+      ansible.builtin.slurp:
+        src: "{{ llama_release_dir }}/.last_built"
+      register: llama_cpp_last_built_raw
+
+    # Kept so a rolled-back deploy can put the rollback target back: the
+    # next task overwrites `.previous` with the release being replaced.
+    - name: Remember the current rollback target
+      ansible.builtin.command: cat {{ llama_release_dir }}/.previous
+      register: llama_cpp_prior_previous
+      changed_when: false
+      failed_when: false
+
+    # Only when switching releases: re-deploying the release that's already
+    # current must not overwrite `.previous` with itself, or there would be
+    # nothing left to roll back to.
+    - name: Save previous release pointer (for rollback)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        CUR="{{ llama_release_dir }}/current"
+        NEW="{{ (llama_cpp_last_built_raw.content | b64decode).strip() }}"
+        if [ -L "$CUR" ] && [ "$(readlink -f "$CUR")" != "$(readlink -f "$NEW")" ]; then
+          readlink -f "$CUR" > {{ llama_release_dir }}/.previous
+          echo "saved: $(readlink -f "$CUR")"
+        fi
+      args:
+        executable: /bin/bash
+      register: llama_cpp_save_previous
+      changed_when: "'saved:' in llama_cpp_save_previous.stdout"
+
+    # Registered so the rescue below only rolls back when this deploy
+    # actually switched releases.
+    - name: Cut over `current` symlink to new release
+      ansible.builtin.file:
+        src: "{{ (llama_cpp_last_built_raw.content | b64decode).strip() }}"
+        dest: "{{ llama_release_dir }}/current"
+        state: link
+        force: true
+      register: llama_cpp_cutover
+
+    - name: Install systemd units
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "/etc/systemd/system/{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - {src: llama-server.service.j2, dest: llama-server.service}
+        - {src: metrics-exporter.service.j2, dest: metrics-exporter.service}
+      notify: Reload systemd
+
+    - name: Flush handlers so units are reloaded before (re)start
+      ansible.builtin.meta: flush_handlers
+
+    - name: (Re)start llama-server on the new release
+      ansible.builtin.systemd:
+        name: llama-server
+        state: restarted
+        enabled: true
+
+    # Restarted (not just started) so a changed exporter script or unit
+    # takes effect on the same rollout as the new llama-server release.
+    - name: (Re)start metrics exporter
+      ansible.builtin.systemd:
+        name: metrics-exporter
+        state: restarted
+        enabled: true
+
+    - name: Wait for llama-server and the metrics exporter to accept connections
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: "{{ item }}"
+        delay: 2
+        timeout: "{{ llama_cpp_start_timeout }}"
+      loop:
+        - "{{ llama_server_port }}"
+        - "{{ metrics_port }}"
+
+    # Through the exporter's proxy, so the gate also proves the metrics
+    # sidecar works and the request lands in the fleet's metrics/logs.
+    # A 200 alone isn't enough: the node must actually generate text.
+    - name: Health check — inference smoke test
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ metrics_port }}/completion"
+        method: POST
+        body_format: json
+        body:
+          prompt: "Health check:"
+          n_predict: 8
+        status_code: 200
+        timeout: 30
+      register: llama_cpp_health
+      retries: 3
+      delay: 5
+      until: >-
+        llama_cpp_health.status == 200
+        and (llama_cpp_health.json | default({})).content | default('') | trim | length > 0
+
+    - name: Mark this release healthy
+      ansible.builtin.file:
+        path: "{{ llama_release_dir }}/.healthy"
+        state: touch
+        mode: "0644"
+
+  # Any task above can land here, so only roll back if `current` was
+  # actually moved to a new release. A failure before the cutover (or on a
+  # re-deploy of the release already current) leaves the node on the
+  # release it was serving, and rolling back would downgrade it.
+  rescue:
+    - name: Decide whether this node needs rolling back
+      ansible.builtin.set_fact:
+        llama_cpp_failed_step: "{{ ansible_failed_task.name }}"
+        llama_cpp_needs_rollback: "{{ llama_cpp_cutover is defined and llama_cpp_cutover is changed }}"
+
+    - name: Report the failure
+      ansible.builtin.debug:
+        msg: >-
+          Deploy failed on {{ inventory_hostname }} at '{{ llama_cpp_failed_step }}';
+          {{ 'rolling back.' if llama_cpp_needs_rollback | bool else 'releases were not switched, so not rolling back.' }}
+
+    - name: Include rollback tasks inline
+      when: llama_cpp_needs_rollback | bool
+      ansible.builtin.include_tasks: rollback.yml
+
+    # The rollback restored the release that `.previous` pointed at, which is
+    # now `current` again. Put back the pointer from before this deploy, so a
+    # later rollback still goes one release back rather than to itself.
+    - name: Restore the rollback target from before this deploy
+      when:
+        - llama_cpp_needs_rollback | bool
+        - llama_cpp_prior_previous.rc == 0
+      ansible.builtin.copy:
+        content: "{{ llama_cpp_prior_previous.stdout | trim }}\n"
+        dest: "{{ llama_release_dir }}/.previous"
+        mode: "0644"
+
+    - name: Clear the rollback target (there was none before this deploy)
+      when:
+        - llama_cpp_needs_rollback | bool
+        - llama_cpp_prior_previous.rc != 0
+      ansible.builtin.file:
+        path: "{{ llama_release_dir }}/.previous"
+        state: absent
+
+    - name: Fail the play so the rollout script/CI marks this node red
+      ansible.builtin.fail:
+        msg: >-
+          Deployment to {{ inventory_hostname }} failed at '{{ llama_cpp_failed_step }}'
+          {{ 'and was rolled back to the previous release.' if llama_cpp_needs_rollback | bool
+             else 'before switching releases (or the release was already current); nothing was rolled back.' }}
+
+- name: Rollback to previous release
+  when: llama_cpp_action == 'rollback'
+  ansible.builtin.include_tasks: rollback.yml

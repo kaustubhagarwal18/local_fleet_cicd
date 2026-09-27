@@ -1,0 +1,13 @@
+---
+# One-node-at-a-time rollout. `serial: 1` plus the health-check task in
+# llama_cpp/tasks/main.yml is what gives us the rolling-update / availability
+# guarantee: Ansible will not proceed to the next node if this one fails.
+- name: Rolling deploy of llama-server across the fleet
+  hosts: llama_fleet
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+  roles:
+    - role: llama_cpp
+      vars:
+        llama_cpp_action: deploy
