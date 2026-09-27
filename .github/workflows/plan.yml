@@ -1,0 +1,33 @@
+name: plan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+
+      - name: terraform init & plan
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform plan -out=tfplan
+        env:
+          # No hypervisor is needed: plan never runs the vm module's
+          # provisioners or its get_ip.sh data source (both are apply-time).
+          TF_IN_AUTOMATION: "true"
+
+      - name: Upload plan artifact
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan

@@ -1,0 +1,88 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install linters
+        run: |
+          pip install -r scripts/requirements.txt
+          sudo apt-get update -y && sudo apt-get install -y shellcheck
+          # actionlint: pinned release asset, checksum-verified. A direct
+          # download, so no GitHub API call (and no rate limit under act).
+          ACTIONLINT_VERSION=1.7.12
+          case "$(uname -m)" in
+            x86_64) arch=amd64 sha=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 ;;
+            aarch64) arch=arm64 sha=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6 ;;
+            *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
+          esac
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_${arch}.tar.gz"
+          curl -sSfL -o "$tarball" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${sha}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball" actionlint && sudo mv actionlint /usr/local/bin/ && rm "$tarball"
+
+      - name: actionlint
+        run: actionlint
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+
+      - name: terraform fmt/validate/test
+        working-directory: terraform
+        run: |
+          terraform init -backend=false
+          terraform fmt -check -recursive
+          terraform validate
+          terraform test
+
+      - name: tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          # Pinned: "latest" makes the action query the GitHub API, which
+          # hits the 60 req/h unauthenticated limit under act, and lets CI
+          # change behaviour whenever tflint cuts a release.
+          tflint_version: v0.64.0
+      - run: tflint --chdir=terraform
+
+      - name: yamllint
+        run: yamllint .
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: ansible-lint
+        run: ansible-lint
+
+      - name: pytest (exporter + script tests; e2e excluded)
+        run: pytest
+
+  # Converges the Ansible roles in a container (compiling llama-server), so it
+  # runs as its own job alongside lint. Needs a Docker daemon: GitHub runners
+  # have one, and act mounts the host's socket into the job container.
+  molecule:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Ansible + molecule
+        run: pip install -r scripts/requirements.txt
+
+      - name: molecule test (converge, idempotence, verify)
+        run: make molecule

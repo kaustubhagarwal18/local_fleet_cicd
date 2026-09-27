@@ -1,0 +1,155 @@
+name: rollout
+
+# Manual only. A real rollout drives Multipass and SSHes into the VMs, so it
+# must run on a self-hosted runner on the machine that hosts the fleet; set
+# the FLEET_RUNNER repository variable to that runner's label. GitHub-hosted
+# runners can't reach local VMs, so a push trigger would just fail every push.
+on:
+  workflow_dispatch:
+
+# Under `act` (env.ACT set) every job runs in a Docker container with no
+# route to the host's Multipass/hypervisor, so no VM can be created or
+# reached. Each job therefore swaps its fleet-touching steps for an
+# equivalent static check (validate/plan, playbook syntax, script syntax),
+# which keeps `make act-rollout` a meaningful end-to-end check of the
+# pipeline's shape. `make deploy` runs the real steps on the host. The
+# exception is `verify`: if a fleet from `make deploy` is up, act-rollout.sh
+# hands its inventory to act and the job runs the real e2e tests against it.
+
+jobs:
+  provision:
+    runs-on: ${{ vars.FLEET_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false  # keep terraform state, the fleet SSH key and inventory (all gitignored)
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.4"
+
+      - name: Check this runner can drive the fleet's hypervisor
+        if: ${{ !env.ACT }}
+        run: |
+          command -v multipass >/dev/null || {
+            echo "::error::rollout needs a self-hosted runner on the fleet host (with Multipass)." \
+              "Set the FLEET_RUNNER repository variable to its label."
+            exit 1
+          }
+
+      # The keypair is gitignored, so a fresh checkout never has it;
+      # create.sh needs the public half for cloud-init. Same as deploy.sh.
+      - name: Ensure fleet SSH key
+        run: bash scripts/ensure_ssh_key.sh
+
+      - name: terraform apply
+        if: ${{ !env.ACT }}
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: terraform validate + plan (act)
+        if: ${{ env.ACT }}
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform validate
+          terraform plan
+
+      - name: Upload generated inventory
+        if: ${{ !env.ACT }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: inventory
+          path: ansible/inventory/hosts.ini
+
+  build:
+    needs: provision
+    runs-on: ${{ vars.FLEET_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false  # keep terraform state, the fleet SSH key and inventory (all gitignored)
+      # Ubuntu 24.04's system Python rejects global pip installs (PEP 668).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Ansible
+        run: pip install -r scripts/requirements.txt
+      - name: Base config (toolchain + metrics exporter) on all nodes
+        if: ${{ !env.ACT }}
+        run: ansible-playbook ansible/playbooks/site.yml
+      - name: Build llama.cpp + stage model on all nodes
+        if: ${{ !env.ACT }}
+        run: ansible-playbook ansible/playbooks/build.yml
+      - name: Syntax-check site + build playbooks (act)
+        if: ${{ env.ACT }}
+        run: ansible-playbook --syntax-check ansible/playbooks/site.yml ansible/playbooks/build.yml
+
+  rollout:
+    needs: build
+    runs-on: ${{ vars.FLEET_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false  # keep terraform state, the fleet SSH key and inventory (all gitignored)
+      # Ubuntu 24.04's system Python rejects global pip installs (PEP 668).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Ansible
+        run: pip install -r scripts/requirements.txt
+      - name: Rolling deploy (serial:1, health-gated, auto-rollback)
+        if: ${{ !env.ACT }}
+        run: ansible-playbook ansible/playbooks/deploy.yml
+      - name: Syntax-check deploy + rollback playbooks (act)
+        if: ${{ env.ACT }}
+        run: ansible-playbook --syntax-check ansible/playbooks/deploy.yml ansible/playbooks/rollback.yml
+
+  verify:
+    needs: rollout
+    runs-on: ${{ vars.FLEET_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false  # keep terraform state, the fleet SSH key and inventory (all gitignored)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Ansible + pytest (verify.sh reads hosts via ansible-inventory)
+        run: pip install -r scripts/requirements.txt
+      - name: Download generated inventory
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          name: inventory
+          path: ansible/inventory
+      # There are no artifacts under act, so scripts/act-rollout.sh passes the
+      # host's inventory in FLEET_INVENTORY_B64 when a live fleet answers. The
+      # act container can't drive Multipass, but it can reach the VMs over HTTP.
+      - name: Locate the fleet inventory
+        id: fleet
+        run: |
+          if [ -n "${FLEET_INVENTORY_B64:-}" ]; then
+            base64 -d <<<"$FLEET_INVENTORY_B64" > ansible/inventory/hosts.ini
+          fi
+          if [ -s ansible/inventory/hosts.ini ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${ACT:-}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No live fleet passed in; static checks only (run 'make deploy' first to get e2e under act)."
+          else
+            echo "::error::No inventory from the provision job; refusing to skip the e2e tests."
+            exit 1
+          fi
+      - name: End-to-end smoke test
+        if: steps.fleet.outputs.present == 'true'
+        run: bash scripts/verify.sh
+      - name: E2E tests (pytest -m e2e)
+        if: steps.fleet.outputs.present == 'true'
+        run: pytest -m e2e -v
+      - name: Syntax-check verify scripts (no fleet)
+        if: steps.fleet.outputs.present != 'true'
+        run: |
+          bash -n scripts/verify.sh
+          bash -n scripts/health_check.sh
